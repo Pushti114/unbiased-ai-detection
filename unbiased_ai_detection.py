@@ -8,6 +8,7 @@ from scipy import stats
 from sklearn.feature_selection import mutual_info_classif
 from sklearn.preprocessing import LabelEncoder
 import warnings
+from io import BytesIO
 
 warnings.filterwarnings("ignore")
 
@@ -86,7 +87,7 @@ def preprocess_data(df_bytes, sensitive_features_tuple, target,
     Receives raw CSV bytes so the cache key is stable.
     Returns processed DataFrame, encoded DataFrame, and original sensitive columns.
     """
-    df = pd.read_csv(pd.io.common.BytesIO(df_bytes))
+    df = pd.read_csv(BytesIO(df_bytes))
     sensitive_features = list(sensitive_features_tuple)
 
     sensitive_original = {col: df[col].copy() for col in sensitive_features if col in df.columns}
@@ -137,6 +138,7 @@ def mutual_info_score_custom(x, y):
     elif pd.api.types.is_numeric_dtype(x) and not pd.api.types.is_numeric_dtype(y):
         y_enc = LabelEncoder().fit_transform(y.astype(str))
         mi = mutual_info_classif(x.values.reshape(-1, 1), y_enc, discrete_features=False)[0]
+        y_enc = np.asarray(y_enc)
         ent = stats.entropy(np.bincount(y_enc) / len(y_enc))
         return mi / ent if ent > 0 else 0
     elif not pd.api.types.is_numeric_dtype(x) and pd.api.types.is_numeric_dtype(y):
@@ -550,15 +552,17 @@ if uploaded_file:
                 proxy_results = detect_proxy_features(df_encoded, sensitive_features)
                 st.session_state.proxy_results = proxy_results
 
-                if is_binary_target:
+                if is_binary_target and st.session_state.fairness_metrics:
                     bias_results = {}
-                    for sens, metrics in fairness_metrics.items():
+
+                    for sens, metrics in st.session_state.fairness_metrics.items():
                         if "positive_rates" in metrics:
                             bias_results[sens] = {
                                 "rates": metrics["positive_rates"],
                                 "disparate_impact": metrics["disparate_impact"],
                                 "bias": metrics["bias_flag"]
                             }
+
                     st.session_state.bias_results = bias_results
                 else:
                     st.session_state.bias_results = None
