@@ -1,4 +1,3 @@
-# unbiased_ai_detector.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -114,18 +113,42 @@ def preprocess_data(df_bytes, sensitive_features_tuple, target,
     cols_to_encode = [c for c in categorical_cols if c != target and c not in sensitive_features]
     df_encoded = pd.get_dummies(df, columns=cols_to_encode, drop_first=True)
 
+    # ── Column-presence validation after encoding ──────────────────────────
+    # Target must survive encoding unchanged (it is never in cols_to_encode).
     if target not in df_encoded.columns:
-        raise ValueError(f"Target column '{target}' not found after encoding.")
+        raise ValueError(
+            f"Target column '{target}' not found after one-hot encoding. "
+            "Ensure the target is not accidentally included in cols_to_encode."
+        )
+
+    # Sensitive features must also survive encoding unchanged.
+    # They are excluded from cols_to_encode, so their original column name
+    # should be present. Warn loudly if any are missing.
+    missing_sensitive = [s for s in sensitive_features if s not in df_encoded.columns]
+    if missing_sensitive:
+        raise ValueError(
+            f"Sensitive feature(s) {missing_sensitive} not found in the encoded "
+            "DataFrame. This should not happen — please check for duplicate column "
+            "names or data-loading issues."
+        )
 
     return df_encoded, sensitive_original
 
 
 def cramers_v(x, y):
     confusion_matrix = pd.crosstab(x, y)
-    chi2 = stats.chi2_contingency(confusion_matrix)[0]
+    # Edge case: empty or degenerate table — no association can be measured
+    if confusion_matrix.size == 0:
+        return 0.0
     n = confusion_matrix.sum().sum()
-    phi2 = chi2 / n
+    if n == 0:
+        return 0.0
     r, k = confusion_matrix.shape
+    # Edge case: single row or single column — Cramér's V is undefined
+    if r < 2 or k < 2:
+        return 0.0
+    chi2 = stats.chi2_contingency(confusion_matrix)[0]
+    phi2 = chi2 / n
     phi2corr = max(0, phi2 - ((k - 1) * (r - 1)) / (n - 1))
     rcorr = r - ((r - 1) ** 2) / (n - 1)
     kcorr = k - ((k - 1) ** 2) / (n - 1)
@@ -133,14 +156,28 @@ def cramers_v(x, y):
     return np.sqrt(phi2corr / denom) if denom > 0 else 0.0
 
 def mutual_info_score_custom(x, y):
+    # Zero-variance guard: a constant column carries no information
+    if pd.api.types.is_numeric_dtype(x) and x.nunique() <= 1:
+        return 0.0
+    if pd.api.types.is_numeric_dtype(y) and y.nunique() <= 1:
+        return 0.0
+    # Categorical single-value guard
+    if not pd.api.types.is_numeric_dtype(x) and x.nunique() <= 1:
+        return 0.0
+    if not pd.api.types.is_numeric_dtype(y) and y.nunique() <= 1:
+        return 0.0
+
     if pd.api.types.is_numeric_dtype(x) and pd.api.types.is_numeric_dtype(y):
-        return abs(x.corr(y))
+        corr = x.corr(y)
+        # corr is NaN when std of x or y is 0 (shouldn't reach here, but be safe)
+        return abs(corr) if pd.notna(corr) else 0.0
     elif pd.api.types.is_numeric_dtype(x) and not pd.api.types.is_numeric_dtype(y):
         y_enc = LabelEncoder().fit_transform(y.astype(str))
         mi = mutual_info_classif(x.values.reshape(-1, 1), y_enc, discrete_features=False)[0]
-        y_enc = np.asarray(y_enc)
-        ent = stats.entropy(np.bincount(y_enc) / len(y_enc))
-        return mi / ent if ent > 0 else 0
+        counts = np.bincount(y_enc)
+        probs = counts / counts.sum()
+        ent = stats.entropy(probs)
+        return mi / ent if ent > 0 else 0.0
     elif not pd.api.types.is_numeric_dtype(x) and pd.api.types.is_numeric_dtype(y):
         return mutual_info_score_custom(y, x)
     else:
@@ -154,26 +191,61 @@ def compute_fairness_metrics(df_encoded, target, sensitive_features, sensitive_o
     y_true = df_encoded[target]
     for sens in sensitive_features:
         if sens not in sensitive_originals:
+            results[sens] = {"warning": f"'{sens}' not found in preprocessed data; skipping."}
             continue
-        groups = sensitive_originals[sens].unique()
+
+        groups = sensitive_originals[sens].dropna().unique()
+
+        # Edge case: only one distinct group — DP / DI are meaningless
         if len(groups) < 2:
-            results[sens] = {"warning": "Only one group present, skipping."}
+            results[sens] = {
+                "warning": (
+                    f"Only one group found in '{sens}' "
+                    f"(value: '{groups[0]}' if len(groups) else 'none'). "
+                    "Demographic Parity and Disparate Impact require ≥ 2 groups."
+                )
+            }
             continue
+
+        # Edge case: zero-variance target within this sensitive feature
+        if y_true.nunique() <= 1:
+            results[sens] = {
+                "warning": (
+                    "Target column has zero variance (all values identical). "
+                    "Fairness metrics are undefined."
+                )
+            }
+            continue
+
         rates = {}
         for g in groups:
             mask = (sensitive_originals[sens] == g)
             subset_y = y_true[mask]
             if len(subset_y) == 0:
+                # Empty group after masking — skip silently
                 continue
-            rates[str(g)] = round(subset_y.mean(), 3)
-        if len(rates) > 1:
-            dp_diff = round(max(rates.values()) - min(rates.values()), 3)
-            disparate_impact = round(
-                min(rates.values()) / max(rates.values()), 3
-            ) if max(rates.values()) != 0 else 0
+            rates[str(g)] = round(float(subset_y.mean()), 3)
+
+        # Edge case: after filtering empty groups fewer than 2 remain
+        if len(rates) < 2:
+            results[sens] = {
+                "warning": (
+                    f"Fewer than 2 non-empty groups found for '{sens}' after "
+                    "filtering. Cannot compute parity metrics."
+                )
+            }
+            continue
+
+        max_rate = max(rates.values())
+        min_rate = min(rates.values())
+        dp_diff = round(max_rate - min_rate, 3)
+
+        # Edge case: all groups have a positive rate of 0 — DI is undefined
+        if max_rate == 0:
+            disparate_impact = 1.0   # no positive outcomes → no disparity
         else:
-            dp_diff = 0.0
-            disparate_impact = 1.0
+            disparate_impact = round(min_rate / max_rate, 3)
+
         results[sens] = {
             "positive_rates": rates,
             "demographic_parity_difference": dp_diff,
@@ -194,17 +266,31 @@ def detect_proxy_features(df, sensitive_features, threshold=0.3, max_features=20
     features_to_check = [f for f in all_features if f not in sensitive_features][:max_features]
     for sens in sensitive_features:
         if sens not in df.columns:
+            proxy_results[sens] = {}
             continue
-        associations = {}
+
         sens_series = df[sens]
+
+        # Edge case: zero-variance sensitive feature — skip entirely
+        if sens_series.nunique() <= 1:
+            proxy_results[sens] = {}
+            continue
+
+        associations = {}
         for col in features_to_check:
             if col == sens:
                 continue
+            col_series = df[col] if col in numeric_cols else df[col].astype(str)
+
+            # Edge case: zero-variance candidate column — no information to share
+            if col_series.nunique() <= 1:
+                continue
+
             try:
-                col_series = df[col] if col in numeric_cols else df[col].astype(str)
                 strength = mutual_info_score_custom(sens_series, col_series)
-                if strength > threshold:
-                    associations[col] = round(strength, 3)
+                # Guard against NaN returned by edge paths
+                if pd.notna(strength) and strength > threshold:
+                    associations[col] = round(float(strength), 3)
             except Exception:
                 continue
         proxy_results[sens] = associations
@@ -525,13 +611,17 @@ if uploaded_file:
 
                 # Pass raw bytes so preprocess_data cache key is stable
                 csv_bytes = uploaded_file.getvalue()
-                df_encoded, sensitive_originals = preprocess_data(
-                    csv_bytes,
-                    tuple(sensitive_features),   # tuple is hashable; list is not
-                    target_column,
-                    impute_num=impute_num,
-                    impute_cat=impute_cat
-                )
+                try:
+                    df_encoded, sensitive_originals = preprocess_data(
+                        csv_bytes,
+                        tuple(sensitive_features),   # tuple is hashable; list is not
+                        target_column,
+                        impute_num=impute_num,
+                        impute_cat=impute_cat
+                    )
+                except ValueError as exc:
+                    st.error(f"❌ Preprocessing failed: {exc}")
+                    st.stop()
 
                 # Re-apply target transformation on the cached encoded df
                 # (preprocess_data operates on the raw CSV; target transform is separate)
